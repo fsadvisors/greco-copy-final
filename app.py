@@ -55,56 +55,56 @@ HEADER_ALIASES = {
     "cess amount":    "CESS",
 }
 
+from difflib import SequenceMatcher
+import re
+
 def map_headers(raw_cols):
+    """
+    Map each raw column name to exactly one of STANDARD_HEADERS
+    via a combined SequenceMatcher + Jaccard score and a greedy assignment.
+    """
+    # pre-normalize
+    def normalize(s):
+        return re.sub(r'\W+', ' ', s).strip().lower()
+    raw_norm = [normalize(c) for c in raw_cols]
+    std_norm = [normalize(s) for s in STANDARD_HEADERS]
+
+    # build all (score, raw_idx, std_idx) triples
+    triples = []
+    for i, r in enumerate(raw_norm):
+        tokens_r = set(r.split())
+        for j, s in enumerate(std_norm):
+            tokens_s = set(s.split())
+            # seq ratio
+            seq = SequenceMatcher(None, r, s).ratio()
+            # jaccard
+            jac = len(tokens_r & tokens_s) / len(tokens_r | tokens_s) if (tokens_r|tokens_s) else 0
+            score = 0.7*seq + 0.3*jac
+            triples.append((score, i, j))
+    # sort descending
+    triples.sort(reverse=True, key=lambda x: x[0])
+
     mapping = {}
-    used = set()
-    raw_lower = [c.strip().lower() for c in raw_cols]
+    used_raw = set()
+    used_std = set()
 
-    # 1) exact alias
-    for i, col in enumerate(raw_cols):
-        key = raw_lower[i]
-        if key in HEADER_ALIASES:
-            mapping[col] = HEADER_ALIASES[key]
-            used.add(col)
+    # greedy one-to-one assignment
+    for score, i, j in triples:
+        if i in used_raw or j in used_std:
+            continue
+        mapping[raw_cols[i]] = STANDARD_HEADERS[j]
+        used_raw.add(i)
+        used_std.add(j)
+        if len(used_std) == len(STANDARD_HEADERS):
+            break
 
-    # 2) keyword rules
-    for i, col in enumerate(raw_cols):
-        if col in used: continue
-        key = raw_lower[i]
-        if any(k in key for k in ["supplier","party","vendor"]):
-            mapping[col] = "SupplierName"; used.add(col); continue
-        if any(k in key for k in ["invoice no","inv no","voucher","bill no"]):
-            mapping[col] = "InvoiceNo"; used.add(col); continue
-        if "date" in key:
-            mapping[col] = "InvoiceDate"; used.add(col); continue
-        if "gstin" in key or "gst no" in key:
-            mapping[col] = "GSTIN"; used.add(col); continue
-        if "invoice value" in key or "total invoice" in key:
-            mapping[col] = "InvoiceValue"; used.add(col); continue
-        if "taxable" in key:
-            mapping[col] = "TaxableValue"; used.add(col); continue
-        if "cgst" in key:
-            mapping[col] = "CGST"; used.add(col); continue
-        if "sgst" in key:
-            mapping[col] = "SGST"; used.add(col); continue
-        if "igst" in key:
-            mapping[col] = "IGST"; used.add(col); continue
-        if "cess" in key:
-            mapping[col] = "CESS"; used.add(col); continue
-
-    # 3) fuzzy fallback
-    for std in STANDARD_HEADERS:
-        if std in mapping.values(): continue
-        best, best_score = None, -1.0
-        for i, col in enumerate(raw_cols):
-            if col in used: continue
-            score = SequenceMatcher(None, std.lower(), raw_lower[i]).ratio()
-            if score > best_score:
-                best_score, best = score, col
-        mapping[best] = std
-        used.add(best)
+    # safety check (should never happen)
+    if len(mapping) != len(STANDARD_HEADERS):
+        missing = [s for s in STANDARD_HEADERS if s not in mapping.values()]
+        raise KeyError(f"Could not map columns for: {missing}")
 
     return mapping
+
 
 def read_with_header_detection(uploaded_file):
     ext = Path(uploaded_file.name).suffix.lower()
