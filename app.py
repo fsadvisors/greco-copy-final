@@ -35,7 +35,6 @@ STANDARD_HEADERS = [
     "InvoiceValue","TaxableValue","CGST","SGST","IGST","CESS"
 ]
 
-# Quick exact aliases (lowercased)
 HEADER_ALIASES = {
     "supplier name":  "SupplierName",
     "party name":     "SupplierName",
@@ -57,7 +56,7 @@ HEADER_ALIASES = {
 
 def map_headers(raw_cols):
     """
-    1) exact alias (lowercased)
+    1) exact alias by lowercase
     2) keyword substrings
     3) fallback fuzzy match
     """
@@ -118,11 +117,10 @@ def map_headers(raw_cols):
             used.add(col)
             continue
 
-    # 3) fuzzy for anything still missing
+    # 3) fuzzy for what's left
     for std in STANDARD_HEADERS:
         if std in mapping.values():
             continue
-        # find best‐matching raw
         best, best_score = None, -1.0
         for i, col in enumerate(raw_cols):
             if col in used:
@@ -135,15 +133,32 @@ def map_headers(raw_cols):
 
     return mapping
 
+def read_with_header_detection(uploaded_file):
+    """
+    Read an Excel, detect which row contains the real header
+    (first row with ≥5 non-NA values), then re-read with that header.
+    """
+    # read without header
+    tmp = pd.read_excel(uploaded_file, header=None)
+    # find header row
+    header_row = 0
+    for i, row in tmp.iterrows():
+        if row.notna().sum() >= 5:
+            header_row = i
+            break
+    # reset file pointer and read with header
+    uploaded_file.seek(0)
+    return pd.read_excel(uploaded_file, header=header_row)
+
 def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.str.strip()
+    # map headers
     mp = map_headers(df.columns.tolist())
-    # rename & pull exactly the ten columns
     df = df.rename(columns=mp)[STANDARD_HEADERS]
     df.columns = [c + suffix for c in STANDARD_HEADERS]
 
-    # drop dupes, blanks
+    # drop duplicates & blank rows
     df = (
         df.drop_duplicates()
           .replace(r'^\s*$', np.nan, regex=True)
@@ -152,7 +167,7 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     amt_cols = [f"{c}{suffix}" for c in ("InvoiceValue","TaxableValue","IGST","CGST","SGST")]
     df = df.dropna(subset=amt_cols, how="all").reset_index(drop=True)
 
-    # parse date robustly
+    # parse dates
     df[f"InvoiceDate{suffix}"] = pd.to_datetime(
         df[f"InvoiceDate{suffix}"],
         errors="coerce",
@@ -160,7 +175,7 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
         dayfirst=True
     ).dt.date
 
-    # clean IDs
+    # clean IDs & extract PAN
     df[f"InvoiceNo{suffix}"] = (
         df[f"InvoiceNo{suffix}"]
         .astype(str)
@@ -184,7 +199,6 @@ def get_suffix(fn: str) -> str:
     raise ValueError("Filename must include 'portal' or 'books'")
 
 def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
-    # … your unchanged logic here …
     def getval(r,c):
         v = r.get(c,"")
         return "" if pd.isna(v) or str(v).strip()=="" else v
@@ -198,25 +212,25 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
     if all(getval(row,c)=="" for c in gst_cols):   return "❌ Not in 2B"
     if all(getval(row,c)=="" for c in books_cols): return "❌ Not in books"
 
-    # date
+    # date comparison
     bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}",None), errors="coerce")
     gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}",None), errors="coerce")
     if pd.notna(bd) and pd.notna(gd):
         d = abs((bd - gd).days)
-        if d==0: pass
-        elif d<=date_tol: trivial=True
+        if d == 0: pass
+        elif d <= date_tol: trivial = True
         else: mismatches.append("⚠️ Mismatch of InvoiceDate")
 
     # invoice no
     bno = getval(row,f"InvoiceNo{b_sfx}"); gno = getval(row,f"InvoiceNo{g_sfx}")
-    if norm_id(bno)!=norm_id(gno):
+    if norm_id(bno) != norm_id(gno):
         mismatches.append("⚠️ Mismatch of InvoiceNo")
-    elif strip_ws(bno)!=strip_ws(gno):
-        trivial=True
+    elif strip_ws(bno) != strip_ws(gno):
+        trivial = True
 
     # GSTIN
     bg = str(getval(row,f"GSTIN{b_sfx}")).lower(); gg = str(getval(row,f"GSTIN{g_sfx}")).lower()
-    if bg and gg and bg!=gg:
+    if bg and gg and bg != gg:
         mismatches.append("⚠️ Mismatch of GSTIN")
 
     # amounts
@@ -225,15 +239,15 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
         gv = row.get(f"{fld}{g_sfx}",0) or 0
         try:
             diff = abs(float(bv) - float(gv))
-            if diff>amt_tol:  mismatches.append(f"⚠️ Mismatch of {fld}")
-            elif diff>0:      trivial=True
+            if diff > amt_tol: mismatches.append(f"⚠️ Mismatch of {fld}")
+            elif diff > 0:     trivial = True
         except: pass
 
     # supplier similarity
     bp = str(getval(row,f"SupplierName{b_sfx}")); gp = str(getval(row,f"SupplierName{g_sfx}"))
     sc = sim(re.sub(r"[^\w\s]","",bp).lower(), re.sub(r"[^\w\s]","",gp).lower())
-    if sc<0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
-    elif sc<1.0: trivial=True
+    if sc < 0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
+    elif sc < 1.0: trivial = True
 
     if mismatches: return " & ".join(dict.fromkeys(mismatches))
     if trivial:    return "✅ Matched, trivial error"
@@ -251,18 +265,19 @@ with st.expander("⚙️ Threshold Settings", expanded=True):
     date_threshold = st.selectbox("Date diff threshold (days)", [1,2,3,4,5,6], index=4)
 
 if gst_file and books_file:
-    raw1 = pd.read_excel(gst_file)
-    raw2 = pd.read_excel(books_file)
-    s1   = get_suffix(gst_file.name)
-    s2   = get_suffix(books_file.name)
+    # dynamic header detection
+    raw_gst   = read_with_header_detection(gst_file)
+    raw_books = read_with_header_detection(books_file)
+    s1 = get_suffix(gst_file.name)
+    s2 = get_suffix(books_file.name)
 
-    df1 = clean_and_standardize(raw1, s1)
-    df2 = clean_and_standardize(raw2, s2)
+    df1 = clean_and_standardize(raw_gst, s1)
+    df2 = clean_and_standardize(raw_books, s2)
 
-    # build merge key
+    # merge & remarks
     df1["key"] = df1[f"InvoiceNo{s1}"].astype(str) + "_" + df1[f"GSTIN{s1}"]
     df2["key"] = df2[f"InvoiceNo{s2}"].astype(str) + "_" + df2[f"GSTIN{s2}"]
-    merged = pd.merge(df1, df2, on="key", how="outer", suffixes=(s1,s2))
+    merged = pd.merge(df1, df2, on="key", how="outer", suffixes=(s1, s2))
     merged["Remarks"] = merged.apply(
         lambda r: make_remark_logic(r, s1, s2, amt_threshold, date_threshold),
         axis=1
@@ -271,7 +286,7 @@ if gst_file and books_file:
     st.success("✅ Reconciliation Complete!")
     st.session_state.merged = merged
 
-# ── SHOW SUMMARY & TABLE ──
+# ── SUMMARY & DOWNLOAD ──
 if "merged" in st.session_state:
     df = st.session_state.merged
     st.subheader("📊 Summary")
