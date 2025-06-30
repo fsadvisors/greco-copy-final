@@ -1,107 +1,316 @@
+import warnings
 import streamlit as st
 import pandas as pd
-import gdown
-import requests
-from bs4 import BeautifulSoup
-import os
+import numpy as np
+import io
+import re
+from difflib import SequenceMatcher
 
-st.set_page_config(page_title="Greco.AI Reconciliation", page_icon="🧾", layout="wide")
+# ── SUPPRESS DATE-PARSING WARNINGS ──
+warnings.filterwarnings(
+    "ignore",
+    message="Could not infer format, so each element will be parsed individually"
+)
 
-st.sidebar.title("Greco.AI")
-st.sidebar.markdown("Automated reconciliation via public Google Drive folder.")
+# ── PAGE CONFIG ──
+st.set_page_config(page_title="GReco.AI", page_icon="🧾", layout="wide")
 
-# ---- USER INPUT ----
-FOLDER_ID = "1bY4lSwcbn2evjRcpXIpF5N-mdWJHGV3m"
-default_folder_url = f"https://drive.google.com/drive/folders/{FOLDER_ID}"
-folder_url = st.sidebar.text_input("Google Drive Public Folder URL", value=default_folder_url)
+# ── SIDEBAR ──
+st.sidebar.title("GReco.AI")
+st.sidebar.markdown("AI-powered GST ITC reconciliation for CAs.")
+with st.sidebar.expander("🆘 Help & Usage", expanded=True):
+    st.markdown("""
+1. Upload your **GSTR-2B** and **Purchase Register** Excel files (any header format).  
+2. Tweak thresholds if desired.  
+3. Click **Process Reconciliation**.  
+4. View **Summary** & **Details**.  
+5. Download your report.
+""")
+st.sidebar.markdown("---")
+st.sidebar.markdown("Powered by **Felicity Strategic Advisors**")
 
-# ---- SCRAPE GOOGLE DRIVE FOLDER ----
-def get_gdrive_file_links(folder_url):
-    # Get the folder page and scrape file links
-    res = requests.get(folder_url)
-    soup = BeautifulSoup(res.text, "html.parser")
-    links = []
-    for tag in soup.find_all("a"):
-        href = tag.get("href")
-        if href and "/file/d/" in href:
-            # Find file ID and name from nearby tag
-            file_id = href.split("/file/d/")[1].split("/")[0]
-            # File title is not directly available, so we use the Google Drive download link and fuzzy match name from the text.
-            links.append({
-                "id": file_id,
-                "gdown_url": f"https://drive.google.com/uc?id={file_id}",
-                "page_url": "https://drive.google.com" + href,
-                "label": tag.text.strip()
-            })
-    # Remove duplicates
-    uniq = {x["id"]: x for x in links}
-    return list(uniq.values())
+# ── CONSTANTS ──
+STANDARD_HEADERS = [
+    "SupplierName","InvoiceNo","InvoiceDate","GSTIN",
+    "InvoiceValue","TaxableValue","CGST","SGST","IGST","CESS"
+]
 
-def find_latest_file(files, keyword):
-    # Returns the first file (likely latest) matching keyword
-    filtered = [f for f in files if keyword.lower() in f["label"].lower()]
-    # Optionally, sort by label or something else if you use timestamps in file names
-    return filtered[0] if filtered else None
+# Quick exact aliases (lowercased)
+HEADER_ALIASES = {
+    "supplier name":  "SupplierName",
+    "party name":     "SupplierName",
+    "vendor name":    "SupplierName",
+    "invoice no":     "InvoiceNo",
+    "inv no":         "InvoiceNo",
+    "voucher":        "InvoiceNo",
+    "gstin/uin":      "GSTIN",
+    "gst no":         "GSTIN",
+    "invoice date":   "InvoiceDate",
+    "bill date":      "InvoiceDate",
+    "invoice value":  "InvoiceValue",
+    "taxable value":  "TaxableValue",
+    "cgst amount":    "CGST",
+    "sgst amount":    "SGST",
+    "igst amount":    "IGST",
+    "cess amount":    "CESS",
+}
 
-def download_file(url, output_path):
-    # Use gdown for reliable Drive download
-    gdown.download(url, output_path, quiet=True, fuzzy=True)
+def map_headers(raw_cols):
+    """
+    1) exact alias (lowercased)
+    2) keyword substrings
+    3) fallback fuzzy match
+    """
+    mapping = {}
+    used = set()
+    raw_lower = [c.strip().lower() for c in raw_cols]
 
-# ---- MAIN ----
-st.header("📥 Automated File Fetch from Google Drive Folder")
+    # 1) exact alias
+    for i, col in enumerate(raw_cols):
+        key = raw_lower[i]
+        if key in HEADER_ALIASES:
+            mapping[col] = HEADER_ALIASES[key]
+            used.add(col)
 
-files = []
-if folder_url:
-    files = get_gdrive_file_links(folder_url)
-    if not files:
-        st.warning("No files found in this folder. Make sure the folder is public!")
+    # 2) keyword rules
+    for i, col in enumerate(raw_cols):
+        if col in used:
+            continue
+        key = raw_lower[i]
+        if any(k in key for k in ["supplier","party","vendor"]):
+            mapping[col] = "SupplierName"
+            used.add(col)
+            continue
+        if any(k in key for k in ["invoice no","inv no","voucher","bill no"]):
+            mapping[col] = "InvoiceNo"
+            used.add(col)
+            continue
+        if "date" in key:
+            mapping[col] = "InvoiceDate"
+            used.add(col)
+            continue
+        if "gstin" in key or "gst no" in key:
+            mapping[col] = "GSTIN"
+            used.add(col)
+            continue
+        if "invoice value" in key or "total invoice" in key:
+            mapping[col] = "InvoiceValue"
+            used.add(col)
+            continue
+        if "taxable" in key:
+            mapping[col] = "TaxableValue"
+            used.add(col)
+            continue
+        if "cgst" in key:
+            mapping[col] = "CGST"
+            used.add(col)
+            continue
+        if "sgst" in key:
+            mapping[col] = "SGST"
+            used.add(col)
+            continue
+        if "igst" in key:
+            mapping[col] = "IGST"
+            used.add(col)
+            continue
+        if "cess" in key:
+            mapping[col] = "CESS"
+            used.add(col)
+            continue
+
+    # 3) fuzzy for anything still missing
+    for std in STANDARD_HEADERS:
+        if std in mapping.values():
+            continue
+        # find best‐matching raw
+        best, best_score = None, -1.0
+        for i, col in enumerate(raw_cols):
+            if col in used:
+                continue
+            score = SequenceMatcher(None, std.lower(), raw_lower[i]).ratio()
+            if score > best_score:
+                best_score, best = score, col
+        mapping[best] = std
+        used.add(best)
+
+    return mapping
+
+def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+    mp = map_headers(df.columns.tolist())
+    # rename & pull exactly the ten columns
+    df = df.rename(columns=mp)[STANDARD_HEADERS]
+    df.columns = [c + suffix for c in STANDARD_HEADERS]
+
+    # drop dupes, blanks
+    df = (
+        df.drop_duplicates()
+          .replace(r'^\s*$', np.nan, regex=True)
+          .dropna(subset=[f"InvoiceNo{suffix}", f"GSTIN{suffix}"], how="any")
+    )
+    amt_cols = [f"{c}{suffix}" for c in ("InvoiceValue","TaxableValue","IGST","CGST","SGST")]
+    df = df.dropna(subset=amt_cols, how="all").reset_index(drop=True)
+
+    # parse date robustly
+    df[f"InvoiceDate{suffix}"] = pd.to_datetime(
+        df[f"InvoiceDate{suffix}"],
+        errors="coerce",
+        infer_datetime_format=True,
+        dayfirst=True
+    ).dt.date
+
+    # clean IDs
+    df[f"InvoiceNo{suffix}"] = (
+        df[f"InvoiceNo{suffix}"]
+        .astype(str)
+        .str.replace(r"\W+", "", regex=True)
+        .str.upper()
+    )
+    df[f"GSTIN{suffix}"] = (
+        df[f"GSTIN{suffix}"]
+        .astype(str)
+        .str.replace(r"\W+", "", regex=True)
+        .str.upper()
+    )
+    df[f"PAN{suffix}"] = df[f"GSTIN{suffix}"].str.slice(2, 12)
+
+    return df
+
+def get_suffix(fn: str) -> str:
+    fnl = fn.lower()
+    if "portal" in fnl: return "_portal"
+    if "books"  in fnl: return "_books"
+    raise ValueError("Filename must include 'portal' or 'books'")
+
+def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
+    # … your unchanged logic here …
+    def getval(r,c):
+        v = r.get(c,"")
+        return "" if pd.isna(v) or str(v).strip()=="" else v
+    def norm_id(s):  return re.sub(r"[\W_]+","",str(s)).lower()
+    def strip_ws(s): return re.sub(r"\s+","",str(s)).lower()
+    def sim(a,b):    return SequenceMatcher(None,a,b).ratio()
+
+    mismatches, trivial = [], False
+    gst_cols   = [c+g_sfx for c in STANDARD_HEADERS]
+    books_cols = [c+b_sfx for c in STANDARD_HEADERS]
+    if all(getval(row,c)=="" for c in gst_cols):   return "❌ Not in 2B"
+    if all(getval(row,c)=="" for c in books_cols): return "❌ Not in books"
+
+    # date
+    bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}",None), errors="coerce")
+    gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}",None), errors="coerce")
+    if pd.notna(bd) and pd.notna(gd):
+        d = abs((bd - gd).days)
+        if d==0: pass
+        elif d<=date_tol: trivial=True
+        else: mismatches.append("⚠️ Mismatch of InvoiceDate")
+
+    # invoice no
+    bno = getval(row,f"InvoiceNo{b_sfx}"); gno = getval(row,f"InvoiceNo{g_sfx}")
+    if norm_id(bno)!=norm_id(gno):
+        mismatches.append("⚠️ Mismatch of InvoiceNo")
+    elif strip_ws(bno)!=strip_ws(gno):
+        trivial=True
+
+    # GSTIN
+    bg = str(getval(row,f"GSTIN{b_sfx}")).lower(); gg = str(getval(row,f"GSTIN{g_sfx}")).lower()
+    if bg and gg and bg!=gg:
+        mismatches.append("⚠️ Mismatch of GSTIN")
+
+    # amounts
+    for fld in ["InvoiceValue","TaxableValue","IGST","CGST","SGST","CESS"]:
+        bv = row.get(f"{fld}{b_sfx}",0) or 0
+        gv = row.get(f"{fld}{g_sfx}",0) or 0
+        try:
+            diff = abs(float(bv) - float(gv))
+            if diff>amt_tol:  mismatches.append(f"⚠️ Mismatch of {fld}")
+            elif diff>0:      trivial=True
+        except: pass
+
+    # supplier similarity
+    bp = str(getval(row,f"SupplierName{b_sfx}")); gp = str(getval(row,f"SupplierName{g_sfx}"))
+    sc = sim(re.sub(r"[^\w\s]","",bp).lower(), re.sub(r"[^\w\s]","",gp).lower())
+    if sc<0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
+    elif sc<1.0: trivial=True
+
+    if mismatches: return " & ".join(dict.fromkeys(mismatches))
+    if trivial:    return "✅ Matched, trivial error"
+    return "✅ Matched"
+
+# ── UPLOAD & PROCESS ──
+col1, col2 = st.columns(2)
+with col1:
+    gst_file   = st.file_uploader("GSTR-2B Excel",   type=["xls","xlsx"])
+with col2:
+    books_file = st.file_uploader("Purchase Register Excel", type=["xls","xlsx"])
+
+with st.expander("⚙️ Threshold Settings", expanded=True):
+    amt_threshold  = st.selectbox("Amount diff threshold",  [0.01,0.1,1,10,100], index=0)
+    date_threshold = st.selectbox("Date diff threshold (days)", [1,2,3,4,5,6], index=4)
+
+if gst_file and books_file:
+    raw1 = pd.read_excel(gst_file)
+    raw2 = pd.read_excel(books_file)
+    s1   = get_suffix(gst_file.name)
+    s2   = get_suffix(books_file.name)
+
+    df1 = clean_and_standardize(raw1, s1)
+    df2 = clean_and_standardize(raw2, s2)
+
+    # build merge key
+    df1["key"] = df1[f"InvoiceNo{s1}"].astype(str) + "_" + df1[f"GSTIN{s1}"]
+    df2["key"] = df2[f"InvoiceNo{s2}"].astype(str) + "_" + df2[f"GSTIN{s2}"]
+    merged = pd.merge(df1, df2, on="key", how="outer", suffixes=(s1,s2))
+    merged["Remarks"] = merged.apply(
+        lambda r: make_remark_logic(r, s1, s2, amt_threshold, date_threshold),
+        axis=1
+    )
+
+    st.success("✅ Reconciliation Complete!")
+    st.session_state.merged = merged
+
+# ── SHOW SUMMARY & TABLE ──
+if "merged" in st.session_state:
+    df = st.session_state.merged
+    st.subheader("📊 Summary")
+    counts = {
+        "matched":  int(df.Remarks.eq("✅ Matched").sum()),
+        "trivial":  int(df.Remarks.str.contains("trivial").sum()),
+        "mismatch": int(df.Remarks.str.contains("⚠️").sum()),
+        "missing":  int(df.Remarks.str.contains("❌").sum()),
+    }
+    c1,c2,c3,c4 = st.columns(4)
+    if c1.button(f"✅ Matched\n{counts['matched']}"):     st.session_state.filter="matched"
+    if c2.button(f"✅ Trivial\n{counts['trivial']}"):    st.session_state.filter="trivial"
+    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"):  st.session_state.filter="mismatch"
+    if c4.button(f"❌ Missing\n{counts['missing']}"):    st.session_state.filter="missing"
+
+    flt = st.session_state.get("filter",None)
+    def filter_df(df,cat):
+        if cat=="matched":   return df[df.Remarks=="✅ Matched"]
+        if cat=="trivial":   return df[df.Remarks.str.contains("trivial")]
+        if cat=="mismatch":  return df[df.Remarks.str.contains("⚠️")]
+        if cat=="missing":   return df[df.Remarks.str.contains("❌")]
+        return df
+
+    sub = filter_df(df,flt).drop(columns=["key"],errors="ignore")
+    if sub.empty:
+        st.info("No records in this category.")
     else:
-        st.success(f"Found {len(files)} file(s) in Google Drive folder.")
-        with st.expander("Show all detected files"):
-            for f in files:
-                st.markdown(f"- {f['label']}")
+        page_size = 30
+        total     = len(sub)
+        pages     = (total-1)//page_size + 1
+        page      = st.number_input("Page",1,pages,value=1)
+        st.dataframe(sub.iloc[(page-1)*page_size : page*page_size],height=400)
 
-# ---- Find GST and Books Files ----
-gst_file_info = find_latest_file(files, "_gst")
-books_file_info = find_latest_file(files, "_books")
-
-# ---- Download and Load Data ----
-def load_any_file(filepath):
-    ext = os.path.splitext(filepath)[1].lower()
-    if ext == ".csv":
-        return pd.read_csv(filepath)
-    elif ext in [".xls", ".xlsx"]:
-        return pd.read_excel(filepath)
-    else:
-        return None
-
-gst_path = books_path = None
-df_gst = df_books = None
-
-if gst_file_info:
-    gst_path = "/tmp/gst_data" + (".csv" if gst_file_info["label"].lower().endswith(".csv") else ".xlsx")
-    download_file(gst_file_info["gdown_url"], gst_path)
-    df_gst = load_any_file(gst_path)
-    st.success(f"GST Data: {gst_file_info['label']} loaded!")
-
-if books_file_info:
-    books_path = "/tmp/books_data" + (".csv" if books_file_info["label"].lower().endswith(".csv") else ".xlsx")
-    download_file(books_file_info["gdown_url"], books_path)
-    df_books = load_any_file(books_path)
-    st.success(f"Books Data: {books_file_info['label']} loaded!")
-
-if not gst_file_info or not books_file_info:
-    st.warning("Did not find both GST and Books files (_gst, _books) in the folder.")
-
-# ---- Display Preview ----
-if df_gst is not None:
-    st.subheader("GST Data (Preview)")
-    st.dataframe(df_gst.head())
-
-if df_books is not None:
-    st.subheader("Books Data (Preview)")
-    st.dataframe(df_books.head())
-
-if df_gst is not None and df_books is not None:
-    st.success("Both files loaded! You can proceed with your reconciliation logic here.")
-    # ...Insert your reconciliation logic below...
+        buf = io.BytesIO()
+        sub.to_excel(buf,index=False)
+        buf.seek(0)
+        st.download_button(
+            "Download Filtered Report",
+            data=buf,
+            file_name="filtered_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
