@@ -1,11 +1,5 @@
 streamlit
-openai
 pandas
 numpy
+xlrd==2.0.1
 openpyxl
-tqdm
-gdown
-beautifulsoup4
-requests
-xlrd
-
