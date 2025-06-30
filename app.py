@@ -67,7 +67,7 @@ def map_headers(df: pd.DataFrame) -> dict:
         cnt = len(ser)
         uniq   = ser.nunique() / n if n else 0
         num    = ser.str.match(r'^-?\d+(\.\d+)?$').sum() / cnt if cnt else 0
-        date   = ser.apply(lambda v: bool(pd.to_datetime(v, errors='coerce'))).sum() / cnt if cnt else 0
+        date   = ser.apply(lambda v: pd.to_datetime(v, errors='coerce')).notna().sum() / cnt if cnt else 0
         gstin  = ser.str.match(GSTIN_RE).sum() / cnt if cnt else 0
         alnum  = ser.apply(lambda v: bool(re.search(r'[A-Za-z]', v) and re.search(r'\d', v))).sum() / cnt if cnt else 0
         metrics[col] = {
@@ -117,7 +117,6 @@ def map_headers(df: pd.DataFrame) -> dict:
 def read_with_header_detection(uploaded_file):
     ext = Path(uploaded_file.name).suffix.lower()
     engine = "xlrd" if ext == ".xls" else "openpyxl"
-
     peek = pd.read_excel(uploaded_file, header=None, engine=engine)
     candidates = ["supplier","party","vendor","invoice","voucher","bill","date",
                   "gstin","value","taxable","cgst","sgst","igst","cess"]
@@ -129,7 +128,6 @@ def read_with_header_detection(uploaded_file):
         )
         if score > best_score:
             best_score, best_idx = score, i
-
     uploaded_file.seek(0)
     return pd.read_excel(uploaded_file, header=best_idx, engine=engine)
 
@@ -146,10 +144,10 @@ def clean_and_standardize(raw: pd.DataFrame, suffix: str) -> pd.DataFrame:
     selected = [std_to_raw[s] for s in STANDARD_HEADERS]
 
     df_sel = df[selected].copy()
-    df_sel.columns = STANDARD_HEADERS[:]
+    df_sel.columns = STANDARD_HEADERS[:]  # exactly ten columns logical order
     df_sel.columns = [f"{c}{suffix}" for c in STANDARD_HEADERS]
 
-    # 3) drop dupes, blanks
+    # 3) drop duplicates & blank rows
     df_sel = (
         df_sel.drop_duplicates()
               .replace(r'^\s*$', np.nan, regex=True)
@@ -169,8 +167,8 @@ def clean_and_standardize(raw: pd.DataFrame, suffix: str) -> pd.DataFrame:
 
     # 5) normalize InvoiceNo
     inv = df_sel[f"InvoiceNo{suffix}"].astype(str).str.strip()
-    inv = inv.str.replace(r"\.0$",    "", regex=True)
-    inv = inv.str.replace(r"\W+",      "", regex=True).str.upper()
+    inv = inv.str.replace(r"\.0$", "", regex=True)
+    inv = inv.str.replace(r"\W+", "", regex=True).str.upper()
     df_sel[f"InvoiceNo{suffix}"] = inv
 
     # 6) clean GSTIN & extract PAN
@@ -181,7 +179,7 @@ def clean_and_standardize(raw: pd.DataFrame, suffix: str) -> pd.DataFrame:
         .str.upper()
     )
     df_sel[f"GSTIN{suffix}"] = gst
-    df_sel[f"PAN{suffix}"]   = gst.str.slice(2, 12)
+    df_sel[f"PAN{suffix}"] = gst.str.slice(2, 12)
 
     return df_sel
 
@@ -191,5 +189,150 @@ def get_suffix(fn: str) -> str:
     if "books"  in lf: return "_books"
     raise ValueError("Filename must include 'portal' or 'books'")
 
-# … the rest of your reconcile + remark + UI code stays exactly the same …
-# i.e. read files, clean_and_standardize, build key, merge, make_remark_logic, show tables, etc.
+# ── REMARK LOGIC ──
+def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
+    def getval(r,c):
+        v = r.get(c,"")
+        return "" if pd.isna(v) or not str(v).strip() else v
+    def norm_id(s):  return re.sub(r"[\W_]+","",str(s)).lower()
+    def strip_ws(s): return re.sub(r"\s+","",str(s)).lower()
+    def sim(a,b):    return SequenceMatcher(None,a,b).ratio()
+
+    mismatches, trivial = [], False
+    gst_cols   = [f"{c}{g_sfx}" for c in STANDARD_HEADERS]
+    books_cols = [f"{c}{b_sfx}" for c in STANDARD_HEADERS]
+
+    if all(getval(row,c)=="" for c in gst_cols):
+        return "❌ Not in 2B"
+    if all(getval(row,c)=="" for c in books_cols):
+        return "❌ Not in books"
+
+    # date
+    bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}"), errors="coerce")
+    gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}"), errors="coerce")
+    if pd.notna(bd) and pd.notna(gd):
+        d = abs((bd - gd).days)
+        if d > date_tol:
+            mismatches.append("⚠️ Mismatch of InvoiceDate")
+        elif d > 0:
+            trivial = True
+
+    # invoice no
+    bno = getval(row, f"InvoiceNo{b_sfx}")
+    gno = getval(row, f"InvoiceNo{g_sfx}")
+    if norm_id(bno) != norm_id(gno):
+        mismatches.append("⚠️ Mismatch of InvoiceNo")
+    elif strip_ws(bno) != strip_ws(gno):
+        trivial = True
+
+    # GSTIN
+    bg = str(getval(row, f"GSTIN{b_sfx}")).lower()
+    gg = str(getval(row, f"GSTIN{g_sfx}")).lower()
+    if bg and gg and bg != gg:
+        mismatches.append("⚠️ Mismatch of GSTIN")
+
+    # amounts
+    for fld in ["InvoiceValue","TaxableValue","IGST","CGST","SGST","CESS"]:
+        bv = row.get(f"{fld}{b_sfx}", 0) or 0
+        gv = row.get(f"{fld}{g_sfx}", 0) or 0
+        try:
+            diff = abs(float(bv) - float(gv))
+            if diff > amt_tol:
+                mismatches.append(f"⚠️ Mismatch of {fld}")
+            elif diff > 0:
+                trivial = True
+        except:
+            pass
+
+    # supplier name
+    bp = str(getval(row, f"SupplierName{b_sfx}"))
+    gp = str(getval(row, f"SupplierName{g_sfx}"))
+    sc = sim(
+        re.sub(r"[^\w\s]", "", bp).lower(),
+        re.sub(r"[^\w\s]", "", gp).lower()
+    )
+    if sc < 0.8:
+        mismatches.append("⚠️ Mismatch of SupplierName")
+    elif sc < 1.0:
+        trivial = True
+
+    if mismatches:
+        return " & ".join(dict.fromkeys(mismatches))
+    if trivial:
+        return "✅ Matched, trivial error"
+    return "✅ Matched"
+
+# ── UPLOAD & PROCESS ──
+col1, col2 = st.columns(2)
+with col1:
+    gst_file   = st.file_uploader("GSTR-2B Excel",   type=["xls","xlsx"])
+with col2:
+    books_file = st.file_uploader("Purchase Register Excel", type=["xls","xlsx"])
+
+with st.expander("⚙️ Threshold Settings", expanded=True):
+    amt_threshold  = st.selectbox("Amount difference threshold",  [0.01,0.1,1,10,100], index=0)
+    date_threshold = st.selectbox("Date difference threshold (days)", [1,2,3,4,5,6], index=4)
+
+if gst_file and books_file:
+    raw_gst   = read_with_header_detection(gst_file)
+    raw_books = read_with_header_detection(books_file)
+    s1        = get_suffix(gst_file.name)
+    s2        = get_suffix(books_file.name)
+
+    df1 = clean_and_standardize(raw_gst,  s1)
+    df2 = clean_and_standardize(raw_books, s2)
+
+    df1["key"] = df1[f"InvoiceNo{s1}"].astype(str) + "_" + df1[f"GSTIN{s1}"]
+    df2["key"] = df2[f"InvoiceNo{s2}"].astype(str) + "_" + df2[f"GSTIN{s2}"]
+    merged = pd.merge(df1, df2, on="key", how="outer", suffixes=(s1, s2))
+    merged["Remarks"] = merged.apply(
+        lambda r: make_remark_logic(r, s1, s2, amt_threshold, date_threshold),
+        axis=1
+    )
+
+    st.success("✅ Reconciliation Complete!")
+    st.session_state.merged = merged
+
+# ── SUMMARY & DOWNLOAD ──
+if "merged" in st.session_state:
+    df = st.session_state.merged
+    st.subheader("📊 Summary")
+    counts = {
+        "matched":  int(df.Remarks.eq("✅ Matched").sum()),
+        "trivial":  int(df.Remarks.str.contains("trivial").sum()),
+        "mismatch": int(df.Remarks.str.contains("⚠️").sum()),
+        "missing":  int(df.Remarks.str.contains("❌").sum()),
+    }
+    c1, c2, c3, c4 = st.columns(4)
+    if c1.button(f"✅ Matched\n{counts['matched']}"):    st.session_state.filter="matched"
+    if c2.button(f"✅ Trivial\n{counts['trivial']}"):   st.session_state.filter="trivial"
+    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"): st.session_state.filter="mismatch"
+    if c4.button(f"❌ Missing\n{counts['missing']}"):   st.session_state.filter="missing"
+
+    flt = st.session_state.get("filter", None)
+    def filter_df(df, cat):
+        if cat=="matched":   return df[df.Remarks=="✅ Matched"]
+        if cat=="trivial":   return df[df.Remarks.str.contains("trivial")]
+        if cat=="mismatch":  return df[df.Remarks.str.contains("⚠️")]
+        if cat=="missing":   return df[df.Remarks.str.contains("❌")]
+        return df
+
+    sub = filter_df(df, flt).drop(columns=["key"], errors="ignore")
+    if sub.empty:
+        st.info("No records in this category.")
+    else:
+        page_size = 30
+        total     = len(sub)
+        pages     = (total - 1)//page_size + 1
+        page      = st.number_input("Page", 1, pages, value=1)
+        st.dataframe(sub.iloc[(page-1)*page + 0 : page*page_size], height=400)
+
+        buf = io.BytesIO()
+        sub.to_excel(buf, index=False)
+        buf.seek(0)
+        st.download_button(
+            "Download Filtered Report",
+            data=buf,
+            file_name="filtered_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
