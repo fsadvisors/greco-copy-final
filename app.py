@@ -140,15 +140,9 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
             std_to_raw[std] = raw
 
     # select exactly one raw per standard, in order
-    selected = []
-    for std in STANDARD_HEADERS:
-        raw = std_to_raw.get(std)
-        if raw is None:
-            raise KeyError(f"No column mapped for {std}")
-        selected.append(raw)
-
+    selected = [std_to_raw[std] for std in STANDARD_HEADERS]
     df_sel = df0[selected].copy()
-    df_sel.columns = STANDARD_HEADERS[:]           # now exactly 10 columns
+    df_sel.columns = STANDARD_HEADERS[:]
     df_sel.columns = [f"{c}{suffix}" for c in df_sel.columns]
 
     # drop dupes & blanks
@@ -169,20 +163,21 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
         dayfirst=True
     ).dt.date
 
-    # clean IDs & extract PAN
-    df_sel[f"InvoiceNo{suffix}"] = (
-        df_sel[f"InvoiceNo{suffix}"]
-        .astype(str)
-        .str.replace(r"\W+", "", regex=True)
-        .str.upper()
-    )
-    df_sel[f"GSTIN{suffix}"] = (
+    # normalize InvoiceNo: remove trailing “.0” on floats, strip non-alphanumerics, uppercase
+    inv = df_sel[f"InvoiceNo{suffix}"].astype(str).str.strip()
+    inv = inv.str.replace(r"\.0$", "", regex=True)
+    inv = inv.str.replace(r"\W+", "", regex=True).str.upper()
+    df_sel[f"InvoiceNo{suffix}"] = inv
+
+    # clean GSTIN & extract PAN
+    gst = (
         df_sel[f"GSTIN{suffix}"]
         .astype(str)
         .str.replace(r"\W+", "", regex=True)
         .str.upper()
     )
-    df_sel[f"PAN{suffix}"] = df_sel[f"GSTIN{suffix}"].str.slice(2, 12)
+    df_sel[f"GSTIN{suffix}"] = gst
+    df_sel[f"PAN{suffix}"] = gst.str.slice(2, 12)
 
     return df_sel
 
