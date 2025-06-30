@@ -21,8 +21,8 @@ st.sidebar.title("GReco.AI")
 st.sidebar.markdown("AI-powered GST ITC reconciliation for CAs.")
 with st.sidebar.expander("🆘 Help & Usage", expanded=True):
     st.markdown("""
-1. Upload your **GSTR-2B** and **Purchase Register** Excel files (any header format).  
-2. Tweak thresholds if desired.  
+1. Upload your **GSTR-2B** and **Purchase Register** files (any header format, .xls or .xlsx).  
+2. Tweak thresholds if needed.  
 3. Click **Process Reconciliation**.  
 4. View **Summary** & **Details**.  
 5. Download your report.
@@ -36,7 +36,6 @@ STANDARD_HEADERS = [
     "InvoiceValue","TaxableValue","CGST","SGST","IGST","CESS"
 ]
 
-# for exact alias matches
 HEADER_ALIASES = {
     "supplier name":  "SupplierName",
     "party name":     "SupplierName",
@@ -57,11 +56,6 @@ HEADER_ALIASES = {
 }
 
 def map_headers(raw_cols):
-    """
-    1) exact alias by lowercase
-    2) keyword substrings
-    3) fallback fuzzy match
-    """
     mapping = {}
     used = set()
     raw_lower = [c.strip().lower() for c in raw_cols]
@@ -75,7 +69,8 @@ def map_headers(raw_cols):
 
     # 2) keyword rules
     for i, col in enumerate(raw_cols):
-        if col in used: continue
+        if col in used: 
+            continue
         key = raw_lower[i]
         if any(k in key for k in ["supplier","party","vendor"]):
             mapping[col] = "SupplierName"; used.add(col); continue
@@ -100,10 +95,12 @@ def map_headers(raw_cols):
 
     # 3) fuzzy fallback
     for std in STANDARD_HEADERS:
-        if std in mapping.values(): continue
+        if std in mapping.values():
+            continue
         best, best_score = None, -1.0
         for i, col in enumerate(raw_cols):
-            if col in used: continue
+            if col in used:
+                continue
             score = SequenceMatcher(None, std.lower(), raw_lower[i]).ratio()
             if score > best_score:
                 best_score, best = score, col
@@ -114,19 +111,22 @@ def map_headers(raw_cols):
 
 def read_with_header_detection(uploaded_file):
     """
-    Dynamically find the true header row by scoring each of the first 10 rows
-    on how many known-header keywords they contain, then re-read with that row
-    as header. Allows .xls or .xlsx (xlrd or openpyxl).
+    1) Peek at the top of the sheet (no header) to score each row for header keywords.
+    2) Choose the row with the highest header-keyword count as header.
+    3) Rewind and re-read with that row as header, using xlrd for .xls or openpyxl for .xlsx.
     """
-    # peek at raw bytes
-    raw = pd.read_excel(uploaded_file, header=None)
+    ext = Path(uploaded_file.name).suffix.lower()
+    engine = "xlrd" if ext == ".xls" else "openpyxl"
+
+    # peek without header
+    peek = pd.read_excel(uploaded_file, header=None, engine=engine)
     candidates = [
         "supplier","party","vendor",
         "invoice","voucher","bill","date","gstin","gst no",
         "value","taxable","cgst","sgst","igst","cess"
     ]
     best_idx, best_score = 0, -1
-    for i, row in raw.head(10).iterrows():
+    for i, row in peek.head(10).iterrows():
         score = 0
         for cell in row:
             if isinstance(cell, str):
@@ -136,15 +136,9 @@ def read_with_header_detection(uploaded_file):
         if score > best_score:
             best_score, best_idx = score, i
 
-    # rewind and re-read using best_idx as header
+    # rewind and read actual header
     uploaded_file.seek(0)
-    ext = Path(uploaded_file.name).suffix.lower()
-    engine = "openpyxl" if ext == ".xlsx" else None  # .xls → let pandas pick xlrd
-    return pd.read_excel(
-        uploaded_file,
-        header=best_idx,
-        engine=engine
-    )
+    return pd.read_excel(uploaded_file, header=best_idx, engine=engine)
 
 def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     df = df.copy()
@@ -186,31 +180,42 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
 
 def get_suffix(fn: str) -> str:
     lf = fn.lower()
-    if "portal" in lf: return "_portal"
-    if "books"  in lf: return "_books"
+    if "portal" in lf:
+        return "_portal"
+    if "books" in lf:
+        return "_books"
     raise ValueError("Filename must include 'portal' or 'books'")
 
 def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
-    def getval(r,c):
-        v = r.get(c,"")
-        return "" if pd.isna(v) or str(v).strip()=="" else v
-    def norm_id(s):  return re.sub(r"[\W_]+","",str(s)).lower()
-    def strip_ws(s): return re.sub(r"\s+","",str(s)).lower()
-    def sim(a,b):    return SequenceMatcher(None,a,b).ratio()
+    def getval(r, c):
+        v = r.get(c, "")
+        return "" if pd.isna(v) or str(v).strip() == "" else v
+    def norm_id(s):
+        return re.sub(r"[\W_]+", "", str(s)).lower()
+    def strip_ws(s):
+        return re.sub(r"\s+", "", str(s)).lower()
+    def sim(a, b):
+        return SequenceMatcher(None, a, b).ratio()
 
     mismatches, trivial = [], False
     gst_cols   = [f"{c}{g_sfx}" for c in STANDARD_HEADERS]
     books_cols = [f"{c}{b_sfx}" for c in STANDARD_HEADERS]
-    if all(getval(row,c)=="" for c in gst_cols):   return "❌ Not in 2B"
-    if all(getval(row,c)=="" for c in books_cols): return "❌ Not in books"
+
+    if all(getval(row, c) == "" for c in gst_cols):
+        return "❌ Not in 2B"
+    if all(getval(row, c) == "" for c in books_cols):
+        return "❌ Not in books"
 
     bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}"), errors="coerce")
     gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}"), errors="coerce")
     if pd.notna(bd) and pd.notna(gd):
         d = abs((bd - gd).days)
-        if d == 0: pass
-        elif d <= date_tol: trivial = True
-        else: mismatches.append("⚠️ Mismatch of InvoiceDate")
+        if d == 0:
+            pass
+        elif d <= date_tol:
+            trivial = True
+        else:
+            mismatches.append("⚠️ Mismatch of InvoiceDate")
 
     bno = getval(row, f"InvoiceNo{b_sfx}")
     gno = getval(row, f"InvoiceNo{g_sfx}")
@@ -238,8 +243,10 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
 
     bp = str(getval(row, f"SupplierName{b_sfx}"))
     gp = str(getval(row, f"SupplierName{g_sfx}"))
-    sc = sim(re.sub(r"[^\w\s]","",bp).lower(),
-             re.sub(r"[^\w\s]","",gp).lower())
+    sc = sim(
+        re.sub(r"[^\w\s]", "", bp).lower(),
+        re.sub(r"[^\w\s]", "", gp).lower()
+    )
     if sc < 0.8:
         mismatches.append("⚠️ Mismatch of SupplierName")
     elif sc < 1.0:
@@ -254,7 +261,7 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
 # ── UPLOAD & PROCESS ──
 col1, col2 = st.columns(2)
 with col1:
-    gst_file   = st.file_uploader("GSTR-2B Excel",   type=["xls","xlsx"])
+    gst_file   = st.file_uploader("GSTR-2B Excel", type=["xls","xlsx"])
 with col2:
     books_file = st.file_uploader("Purchase Register Excel", type=["xls","xlsx"])
 
@@ -293,17 +300,25 @@ if "merged" in st.session_state:
         "missing":  int(df.Remarks.str.contains("❌").sum()),
     }
     c1,c2,c3,c4 = st.columns(4)
-    if c1.button(f"✅ Matched\n{counts['matched']}"):    st.session_state.filter="matched"
-    if c2.button(f"✅ Trivial\n{counts['trivial']}"):   st.session_state.filter="trivial"
-    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"): st.session_state.filter="mismatch"
-    if c4.button(f"❌ Missing\n{counts['missing']}"):   st.session_state.filter="missing"
+    if c1.button(f"✅ Matched\n{counts['matched']}"):
+        st.session_state.filter = "matched"
+    if c2.button(f"✅ Trivial\n{counts['trivial']}"):
+        st.session_state.filter = "trivial"
+    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"):
+        st.session_state.filter = "mismatch"
+    if c4.button(f"❌ Missing\n{counts['missing']}"):
+        st.session_state.filter = "missing"
 
     flt = st.session_state.get("filter", None)
     def filter_df(df, cat):
-        if cat=="matched":   return df[df.Remarks=="✅ Matched"]
-        if cat=="trivial":   return df[df.Remarks.str.contains("trivial")]
-        if cat=="mismatch":  return df[df.Remarks.str.contains("⚠️")]
-        if cat=="missing":   return df[df.Remarks.str.contains("❌")]
+        if cat=="matched":
+            return df[df.Remarks=="✅ Matched"]
+        if cat=="trivial":
+            return df[df.Remarks.str.contains("trivial")]
+        if cat=="mismatch":
+            return df[df.Remarks.str.contains("⚠️")]
+        if cat=="missing":
+            return df[df.Remarks.str.contains("❌")]
         return df
 
     sub = filter_df(df, flt).drop(columns=["key"], errors="ignore")
@@ -312,7 +327,7 @@ if "merged" in st.session_state:
     else:
         page_size = 30
         total     = len(sub)
-        pages     = (total - 1) // page_size + 1
+        pages     = (total-1)//page_size + 1
         page      = st.number_input("Page", 1, pages, value=1)
         st.dataframe(sub.iloc[(page-1)*page_size : page*page_size], height=400)
 
