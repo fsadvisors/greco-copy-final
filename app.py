@@ -77,45 +77,25 @@ def map_headers(raw_cols):
             continue
         key = raw_lower[i]
         if any(k in key for k in ["supplier","party","vendor"]):
-            mapping[col] = "SupplierName"
-            used.add(col)
-            continue
+            mapping[col] = "SupplierName"; used.add(col); continue
         if any(k in key for k in ["invoice no","inv no","voucher","bill no"]):
-            mapping[col] = "InvoiceNo"
-            used.add(col)
-            continue
+            mapping[col] = "InvoiceNo"; used.add(col); continue
         if "date" in key:
-            mapping[col] = "InvoiceDate"
-            used.add(col)
-            continue
+            mapping[col] = "InvoiceDate"; used.add(col); continue
         if "gstin" in key or "gst no" in key:
-            mapping[col] = "GSTIN"
-            used.add(col)
-            continue
+            mapping[col] = "GSTIN"; used.add(col); continue
         if "invoice value" in key or "total invoice" in key:
-            mapping[col] = "InvoiceValue"
-            used.add(col)
-            continue
+            mapping[col] = "InvoiceValue"; used.add(col); continue
         if "taxable" in key:
-            mapping[col] = "TaxableValue"
-            used.add(col)
-            continue
+            mapping[col] = "TaxableValue"; used.add(col); continue
         if "cgst" in key:
-            mapping[col] = "CGST"
-            used.add(col)
-            continue
+            mapping[col] = "CGST"; used.add(col); continue
         if "sgst" in key:
-            mapping[col] = "SGST"
-            used.add(col)
-            continue
+            mapping[col] = "SGST"; used.add(col); continue
         if "igst" in key:
-            mapping[col] = "IGST"
-            used.add(col)
-            continue
+            mapping[col] = "IGST"; used.add(col); continue
         if "cess" in key:
-            mapping[col] = "CESS"
-            used.add(col)
-            continue
+            mapping[col] = "CESS"; used.add(col); continue
 
     # 3) fuzzy for what's left
     for std in STANDARD_HEADERS:
@@ -135,30 +115,28 @@ def map_headers(raw_cols):
 
 def read_with_header_detection(uploaded_file):
     """
-    Read an Excel, detect which row contains the real header
-    (first row with ≥5 non-NA values), then re-read with that header.
+    Read an Excel, detect header row (first with ≥5 non-NA),
+    then re-read with that row as header using openpyxl engine.
     """
     # read without header
-    tmp = pd.read_excel(uploaded_file, header=None)
-    # find header row
+    tmp = pd.read_excel(uploaded_file, header=None, engine="openpyxl")
+    # detect
     header_row = 0
     for i, row in tmp.iterrows():
         if row.notna().sum() >= 5:
             header_row = i
             break
-    # reset file pointer and read with header
     uploaded_file.seek(0)
-    return pd.read_excel(uploaded_file, header=header_row)
+    return pd.read_excel(uploaded_file, header=header_row, engine="openpyxl")
 
 def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.str.strip()
-    # map headers
     mp = map_headers(df.columns.tolist())
     df = df.rename(columns=mp)[STANDARD_HEADERS]
     df.columns = [c + suffix for c in STANDARD_HEADERS]
 
-    # drop duplicates & blank rows
+    # drop dupes & blanks
     df = (
         df.drop_duplicates()
           .replace(r'^\s*$', np.nan, regex=True)
@@ -167,7 +145,7 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     amt_cols = [f"{c}{suffix}" for c in ("InvoiceValue","TaxableValue","IGST","CGST","SGST")]
     df = df.dropna(subset=amt_cols, how="all").reset_index(drop=True)
 
-    # parse dates
+    # parse date
     df[f"InvoiceDate{suffix}"] = pd.to_datetime(
         df[f"InvoiceDate{suffix}"],
         errors="coerce",
@@ -193,13 +171,13 @@ def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     return df
 
 def get_suffix(fn: str) -> str:
-    fnl = fn.lower()
-    if "portal" in fnl: return "_portal"
-    if "books"  in fnl: return "_books"
+    lf = fn.lower()
+    if "portal" in lf: return "_portal"
+    if "books"  in lf: return "_books"
     raise ValueError("Filename must include 'portal' or 'books'")
 
 def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
-    def getval(r,c):
+    def getval(r,c): 
         v = r.get(c,"")
         return "" if pd.isna(v) or str(v).strip()=="" else v
     def norm_id(s):  return re.sub(r"[\W_]+","",str(s)).lower()
@@ -212,42 +190,37 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
     if all(getval(row,c)=="" for c in gst_cols):   return "❌ Not in 2B"
     if all(getval(row,c)=="" for c in books_cols): return "❌ Not in books"
 
-    # date comparison
-    bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}",None), errors="coerce")
-    gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}",None), errors="coerce")
+    bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}"), errors="coerce")
+    gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}"), errors="coerce")
     if pd.notna(bd) and pd.notna(gd):
         d = abs((bd - gd).days)
-        if d == 0: pass
-        elif d <= date_tol: trivial = True
+        if d==0: pass
+        elif d<=date_tol: trivial=True
         else: mismatches.append("⚠️ Mismatch of InvoiceDate")
 
-    # invoice no
-    bno = getval(row,f"InvoiceNo{b_sfx}"); gno = getval(row,f"InvoiceNo{g_sfx}")
-    if norm_id(bno) != norm_id(gno):
+    bno, gno = getval(row,f"InvoiceNo{b_sfx}"), getval(row,f"InvoiceNo{g_sfx}")
+    if norm_id(bno)!=norm_id(gno):
         mismatches.append("⚠️ Mismatch of InvoiceNo")
-    elif strip_ws(bno) != strip_ws(gno):
-        trivial = True
+    elif strip_ws(bno)!=strip_ws(gno):
+        trivial=True
 
-    # GSTIN
     bg = str(getval(row,f"GSTIN{b_sfx}")).lower(); gg = str(getval(row,f"GSTIN{g_sfx}")).lower()
-    if bg and gg and bg != gg:
+    if bg and gg and bg!=gg:
         mismatches.append("⚠️ Mismatch of GSTIN")
 
-    # amounts
     for fld in ["InvoiceValue","TaxableValue","IGST","CGST","SGST","CESS"]:
         bv = row.get(f"{fld}{b_sfx}",0) or 0
         gv = row.get(f"{fld}{g_sfx}",0) or 0
         try:
-            diff = abs(float(bv) - float(gv))
-            if diff > amt_tol: mismatches.append(f"⚠️ Mismatch of {fld}")
-            elif diff > 0:     trivial = True
+            diff = abs(float(bv)-float(gv))
+            if diff>amt_tol: mismatches.append(f"⚠️ Mismatch of {fld}")
+            elif diff>0:     trivial=True
         except: pass
 
-    # supplier similarity
     bp = str(getval(row,f"SupplierName{b_sfx}")); gp = str(getval(row,f"SupplierName{g_sfx}"))
     sc = sim(re.sub(r"[^\w\s]","",bp).lower(), re.sub(r"[^\w\s]","",gp).lower())
-    if sc < 0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
-    elif sc < 1.0: trivial = True
+    if sc<0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
+    elif sc<1.0: trivial=True
 
     if mismatches: return " & ".join(dict.fromkeys(mismatches))
     if trivial:    return "✅ Matched, trivial error"
@@ -261,11 +234,10 @@ with col2:
     books_file = st.file_uploader("Purchase Register Excel", type=["xls","xlsx"])
 
 with st.expander("⚙️ Threshold Settings", expanded=True):
-    amt_threshold  = st.selectbox("Amount diff threshold",  [0.01,0.1,1,10,100], index=0)
+    amt_threshold  = st.selectbox("Amount diff threshold", [0.01,0.1,1,10,100], index=0)
     date_threshold = st.selectbox("Date diff threshold (days)", [1,2,3,4,5,6], index=4)
 
 if gst_file and books_file:
-    # dynamic header detection
     raw_gst   = read_with_header_detection(gst_file)
     raw_books = read_with_header_detection(books_file)
     s1 = get_suffix(gst_file.name)
@@ -274,7 +246,6 @@ if gst_file and books_file:
     df1 = clean_and_standardize(raw_gst, s1)
     df2 = clean_and_standardize(raw_books, s2)
 
-    # merge & remarks
     df1["key"] = df1[f"InvoiceNo{s1}"].astype(str) + "_" + df1[f"GSTIN{s1}"]
     df2["key"] = df2[f"InvoiceNo{s2}"].astype(str) + "_" + df2[f"GSTIN{s2}"]
     merged = pd.merge(df1, df2, on="key", how="outer", suffixes=(s1, s2))
