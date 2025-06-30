@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from difflib import SequenceMatcher
 
-# ── SILENCING DATE WARNINGS ──
+# ── SILENCE DATE-PARSING WARNINGS ──
 warnings.filterwarnings(
     "ignore",
     message="Could not infer format, so each element will be parsed individually"
@@ -36,6 +36,7 @@ STANDARD_HEADERS = [
     "InvoiceValue","TaxableValue","CGST","SGST","IGST","CESS"
 ]
 
+# for exact alias matches
 HEADER_ALIASES = {
     "supplier name":  "SupplierName",
     "party name":     "SupplierName",
@@ -56,6 +57,11 @@ HEADER_ALIASES = {
 }
 
 def map_headers(raw_cols):
+    """
+    1) exact alias by lowercase
+    2) keyword substrings
+    3) fallback fuzzy match
+    """
     mapping = {}
     used = set()
     raw_lower = [c.strip().lower() for c in raw_cols]
@@ -72,25 +78,25 @@ def map_headers(raw_cols):
         if col in used: continue
         key = raw_lower[i]
         if any(k in key for k in ["supplier","party","vendor"]):
-            mapping[col]="SupplierName"; used.add(col); continue
+            mapping[col] = "SupplierName"; used.add(col); continue
         if any(k in key for k in ["invoice no","inv no","voucher","bill no"]):
-            mapping[col]="InvoiceNo"; used.add(col); continue
+            mapping[col] = "InvoiceNo"; used.add(col); continue
         if "date" in key:
-            mapping[col]="InvoiceDate"; used.add(col); continue
+            mapping[col] = "InvoiceDate"; used.add(col); continue
         if "gstin" in key or "gst no" in key:
-            mapping[col]="GSTIN"; used.add(col); continue
+            mapping[col] = "GSTIN"; used.add(col); continue
         if "invoice value" in key or "total invoice" in key:
-            mapping[col]="InvoiceValue"; used.add(col); continue
+            mapping[col] = "InvoiceValue"; used.add(col); continue
         if "taxable" in key:
-            mapping[col]="TaxableValue"; used.add(col); continue
+            mapping[col] = "TaxableValue"; used.add(col); continue
         if "cgst" in key:
-            mapping[col]="CGST"; used.add(col); continue
+            mapping[col] = "CGST"; used.add(col); continue
         if "sgst" in key:
-            mapping[col]="SGST"; used.add(col); continue
+            mapping[col] = "SGST"; used.add(col); continue
         if "igst" in key:
-            mapping[col]="IGST"; used.add(col); continue
+            mapping[col] = "IGST"; used.add(col); continue
         if "cess" in key:
-            mapping[col]="CESS"; used.add(col); continue
+            mapping[col] = "CESS"; used.add(col); continue
 
     # 3) fuzzy fallback
     for std in STANDARD_HEADERS:
@@ -108,43 +114,44 @@ def map_headers(raw_cols):
 
 def read_with_header_detection(uploaded_file):
     """
-    1) Peek at raw bytes with no header, detect which row has ≥5 non-NA values.
-    2) Rewind file, re-read with header=that_row using the correct engine:
-       - .xlsx → openpyxl
-       - .xls  → xlrd (must be installed)
+    Dynamically find the true header row by scoring each of the first 10 rows
+    on how many known-header keywords they contain, then re-read with that row
+    as header. Allows .xls or .xlsx (xlrd or openpyxl).
     """
-    ext = Path(uploaded_file.name).suffix.lower()
-    # step 1: read blindly
-    try:
-        tmp = pd.read_excel(uploaded_file, header=None)
-    except ImportError as e:
-        # likely missing xlrd for .xls
-        st.error(
-            "Failed to read your Excel. "
-            "If you're uploading a .xls file, you need the `xlrd` library installed.\n"
-            "Please add `xlrd` to your requirements and re-deploy."
-        )
-        st.stop()
+    # peek at raw bytes
+    raw = pd.read_excel(uploaded_file, header=None)
+    candidates = [
+        "supplier","party","vendor",
+        "invoice","voucher","bill","date","gstin","gst no",
+        "value","taxable","cgst","sgst","igst","cess"
+    ]
+    best_idx, best_score = 0, -1
+    for i, row in raw.head(10).iterrows():
+        score = 0
+        for cell in row:
+            if isinstance(cell, str):
+                low = cell.strip().lower()
+                if any(tok in low for tok in candidates):
+                    score += 1
+        if score > best_score:
+            best_score, best_idx = score, i
 
-    # find header row
-    header_row = 0
-    for i, row in tmp.iterrows():
-        if row.notna().sum() >= 5:
-            header_row = i
-            break
-
-    # step 2: re-read with that header
+    # rewind and re-read using best_idx as header
     uploaded_file.seek(0)
-    # pick engine explicitly for clarity
-    engine = "openpyxl" if ext == ".xlsx" else None
-    return pd.read_excel(uploaded_file, header=header_row, engine=engine)
+    ext = Path(uploaded_file.name).suffix.lower()
+    engine = "openpyxl" if ext == ".xlsx" else None  # .xls → let pandas pick xlrd
+    return pd.read_excel(
+        uploaded_file,
+        header=best_idx,
+        engine=engine
+    )
 
 def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     df = df.copy()
     df.columns = df.columns.str.strip()
     mp = map_headers(df.columns.tolist())
     df = df.rename(columns=mp)[STANDARD_HEADERS]
-    df.columns = [c + suffix for c in STANDARD_HEADERS]
+    df.columns = [f"{c}{suffix}" for c in STANDARD_HEADERS]
 
     df = (
         df.drop_duplicates()
@@ -192,8 +199,8 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
     def sim(a,b):    return SequenceMatcher(None,a,b).ratio()
 
     mismatches, trivial = [], False
-    gst_cols   = [c+g_sfx for c in STANDARD_HEADERS]
-    books_cols = [c+b_sfx for c in STANDARD_HEADERS]
+    gst_cols   = [f"{c}{g_sfx}" for c in STANDARD_HEADERS]
+    books_cols = [f"{c}{b_sfx}" for c in STANDARD_HEADERS]
     if all(getval(row,c)=="" for c in gst_cols):   return "❌ Not in 2B"
     if all(getval(row,c)=="" for c in books_cols): return "❌ Not in books"
 
@@ -201,36 +208,47 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
     gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}"), errors="coerce")
     if pd.notna(bd) and pd.notna(gd):
         d = abs((bd - gd).days)
-        if d==0: pass
-        elif d<=date_tol: trivial=True
+        if d == 0: pass
+        elif d <= date_tol: trivial = True
         else: mismatches.append("⚠️ Mismatch of InvoiceDate")
 
-    bno, gno = getval(row,f"InvoiceNo{b_sfx}"), getval(row,f"InvoiceNo{g_sfx}")
-    if norm_id(bno)!=norm_id(gno):
+    bno = getval(row, f"InvoiceNo{b_sfx}")
+    gno = getval(row, f"InvoiceNo{g_sfx}")
+    if norm_id(bno) != norm_id(gno):
         mismatches.append("⚠️ Mismatch of InvoiceNo")
-    elif strip_ws(bno)!=strip_ws(gno):
-        trivial=True
+    elif strip_ws(bno) != strip_ws(gno):
+        trivial = True
 
-    bg = str(getval(row,f"GSTIN{b_sfx}")).lower(); gg = str(getval(row,f"GSTIN{g_sfx}")).lower()
-    if bg and gg and bg!=gg:
+    bg = str(getval(row, f"GSTIN{b_sfx}")).lower()
+    gg = str(getval(row, f"GSTIN{g_sfx}")).lower()
+    if bg and gg and bg != gg:
         mismatches.append("⚠️ Mismatch of GSTIN")
 
     for fld in ["InvoiceValue","TaxableValue","IGST","CGST","SGST","CESS"]:
-        bv = row.get(f"{fld}{b_sfx}",0) or 0
-        gv = row.get(f"{fld}{g_sfx}",0) or 0
+        bv = row.get(f"{fld}{b_sfx}", 0) or 0
+        gv = row.get(f"{fld}{g_sfx}", 0) or 0
         try:
-            diff = abs(float(bv)-float(gv))
-            if diff>amt_tol: mismatches.append(f"⚠️ Mismatch of {fld}")
-            elif diff>0:     trivial=True
-        except: pass
+            diff = abs(float(bv) - float(gv))
+            if diff > amt_tol:
+                mismatches.append(f"⚠️ Mismatch of {fld}")
+            elif diff > 0:
+                trivial = True
+        except:
+            pass
 
-    bp = str(getval(row,f"SupplierName{b_sfx}")); gp = str(getval(row,f"SupplierName{g_sfx}"))
-    sc = sim(re.sub(r"[^\w\s]","",bp).lower(), re.sub(r"[^\w\s]","",gp).lower())
-    if sc<0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
-    elif sc<1.0: trivial=True
+    bp = str(getval(row, f"SupplierName{b_sfx}"))
+    gp = str(getval(row, f"SupplierName{g_sfx}"))
+    sc = sim(re.sub(r"[^\w\s]","",bp).lower(),
+             re.sub(r"[^\w\s]","",gp).lower())
+    if sc < 0.8:
+        mismatches.append("⚠️ Mismatch of SupplierName")
+    elif sc < 1.0:
+        trivial = True
 
-    if mismatches: return " & ".join(dict.fromkeys(mismatches))
-    if trivial:    return "✅ Matched, trivial error"
+    if mismatches:
+        return " & ".join(dict.fromkeys(mismatches))
+    if trivial:
+        return "✅ Matched, trivial error"
     return "✅ Matched"
 
 # ── UPLOAD & PROCESS ──
@@ -267,4 +285,43 @@ if gst_file and books_file:
 # ── SUMMARY & DOWNLOAD ──
 if "merged" in st.session_state:
     df = st.session_state.merged
-    # … rest unchanged …
+    st.subheader("📊 Summary")
+    counts = {
+        "matched":  int(df.Remarks.eq("✅ Matched").sum()),
+        "trivial":  int(df.Remarks.str.contains("trivial").sum()),
+        "mismatch": int(df.Remarks.str.contains("⚠️").sum()),
+        "missing":  int(df.Remarks.str.contains("❌").sum()),
+    }
+    c1,c2,c3,c4 = st.columns(4)
+    if c1.button(f"✅ Matched\n{counts['matched']}"):    st.session_state.filter="matched"
+    if c2.button(f"✅ Trivial\n{counts['trivial']}"):   st.session_state.filter="trivial"
+    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"): st.session_state.filter="mismatch"
+    if c4.button(f"❌ Missing\n{counts['missing']}"):   st.session_state.filter="missing"
+
+    flt = st.session_state.get("filter", None)
+    def filter_df(df, cat):
+        if cat=="matched":   return df[df.Remarks=="✅ Matched"]
+        if cat=="trivial":   return df[df.Remarks.str.contains("trivial")]
+        if cat=="mismatch":  return df[df.Remarks.str.contains("⚠️")]
+        if cat=="missing":   return df[df.Remarks.str.contains("❌")]
+        return df
+
+    sub = filter_df(df, flt).drop(columns=["key"], errors="ignore")
+    if sub.empty:
+        st.info("No records in this category.")
+    else:
+        page_size = 30
+        total     = len(sub)
+        pages     = (total - 1) // page_size + 1
+        page      = st.number_input("Page", 1, pages, value=1)
+        st.dataframe(sub.iloc[(page-1)*page_size : page*page_size], height=400)
+
+        buf = io.BytesIO()
+        sub.to_excel(buf, index=False)
+        buf.seek(0)
+        st.download_button(
+            "Download Filtered Report",
+            data=buf,
+            file_name="filtered_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
