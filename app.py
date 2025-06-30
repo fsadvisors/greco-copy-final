@@ -6,7 +6,7 @@ import io
 import re
 from difflib import SequenceMatcher
 
-# ── SUPPRESS DATE-PARSING WARNINGS ──
+# ── SILENCE DATE-PARSING WARNINGS ──
 warnings.filterwarnings(
     "ignore",
     message="Could not infer format, so each element will be parsed individually"
@@ -115,19 +115,21 @@ def map_headers(raw_cols):
 
 def read_with_header_detection(uploaded_file):
     """
-    Read an Excel, detect header row (first with ≥5 non-NA),
-    then re-read with that row as header using openpyxl engine.
+    Read an Excel, detect which row is the header (first with ≥5 non-NA),
+    then re-read using that row as header. Pandas will choose the correct
+    engine based on file extension.
     """
-    # read without header
-    tmp = pd.read_excel(uploaded_file, header=None, engine="openpyxl")
-    # detect
+    # 1) Read raw without header
+    tmp = pd.read_excel(uploaded_file, header=None)
+    # 2) Find header row index
     header_row = 0
     for i, row in tmp.iterrows():
         if row.notna().sum() >= 5:
             header_row = i
             break
+    # 3) Reset pointer and re-read with header_row
     uploaded_file.seek(0)
-    return pd.read_excel(uploaded_file, header=header_row, engine="openpyxl")
+    return pd.read_excel(uploaded_file, header=header_row)
 
 def clean_and_standardize(df: pd.DataFrame, suffix: str) -> pd.DataFrame:
     df = df.copy()
@@ -190,6 +192,7 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
     if all(getval(row,c)=="" for c in gst_cols):   return "❌ Not in 2B"
     if all(getval(row,c)=="" for c in books_cols): return "❌ Not in books"
 
+    # Date
     bd = pd.to_datetime(row.get(f"InvoiceDate{b_sfx}"), errors="coerce")
     gd = pd.to_datetime(row.get(f"InvoiceDate{g_sfx}"), errors="coerce")
     if pd.notna(bd) and pd.notna(gd):
@@ -198,16 +201,19 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
         elif d<=date_tol: trivial=True
         else: mismatches.append("⚠️ Mismatch of InvoiceDate")
 
-    bno, gno = getval(row,f"InvoiceNo{b_sfx}"), getval(row,f"InvoiceNo{g_sfx}")
+    # InvoiceNo
+    bno = getval(row,f"InvoiceNo{b_sfx}"); gno = getval(row,f"InvoiceNo{g_sfx}")
     if norm_id(bno)!=norm_id(gno):
         mismatches.append("⚠️ Mismatch of InvoiceNo")
     elif strip_ws(bno)!=strip_ws(gno):
         trivial=True
 
+    # GSTIN
     bg = str(getval(row,f"GSTIN{b_sfx}")).lower(); gg = str(getval(row,f"GSTIN{g_sfx}")).lower()
     if bg and gg and bg!=gg:
         mismatches.append("⚠️ Mismatch of GSTIN")
 
+    # Amounts
     for fld in ["InvoiceValue","TaxableValue","IGST","CGST","SGST","CESS"]:
         bv = row.get(f"{fld}{b_sfx}",0) or 0
         gv = row.get(f"{fld}{g_sfx}",0) or 0
@@ -217,6 +223,7 @@ def make_remark_logic(row, g_sfx, b_sfx, amt_tol, date_tol):
             elif diff>0:     trivial=True
         except: pass
 
+    # SupplierName
     bp = str(getval(row,f"SupplierName{b_sfx}")); gp = str(getval(row,f"SupplierName{g_sfx}"))
     sc = sim(re.sub(r"[^\w\s]","",bp).lower(), re.sub(r"[^\w\s]","",gp).lower())
     if sc<0.8:   mismatches.append("⚠️ Mismatch of SupplierName")
@@ -246,6 +253,7 @@ if gst_file and books_file:
     df1 = clean_and_standardize(raw_gst, s1)
     df2 = clean_and_standardize(raw_books, s2)
 
+    # Merge & Remarks
     df1["key"] = df1[f"InvoiceNo{s1}"].astype(str) + "_" + df1[f"GSTIN{s1}"]
     df2["key"] = df2[f"InvoiceNo{s2}"].astype(str) + "_" + df2[f"GSTIN{s2}"]
     merged = pd.merge(df1, df2, on="key", how="outer", suffixes=(s1, s2))
@@ -268,10 +276,10 @@ if "merged" in st.session_state:
         "missing":  int(df.Remarks.str.contains("❌").sum()),
     }
     c1,c2,c3,c4 = st.columns(4)
-    if c1.button(f"✅ Matched\n{counts['matched']}"):     st.session_state.filter="matched"
-    if c2.button(f"✅ Trivial\n{counts['trivial']}"):    st.session_state.filter="trivial"
-    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"):  st.session_state.filter="mismatch"
-    if c4.button(f"❌ Missing\n{counts['missing']}"):    st.session_state.filter="missing"
+    if c1.button(f"✅ Matched\n{counts['matched']}"):    st.session_state.filter="matched"
+    if c2.button(f"✅ Trivial\n{counts['trivial']}"):   st.session_state.filter="trivial"
+    if c3.button(f"⚠️ Mismatch\n{counts['mismatch']}"): st.session_state.filter="mismatch"
+    if c4.button(f"❌ Missing\n{counts['missing']}"):   st.session_state.filter="missing"
 
     flt = st.session_state.get("filter",None)
     def filter_df(df,cat):
